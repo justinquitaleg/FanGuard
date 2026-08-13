@@ -1,0 +1,11 @@
+# Logs and Configs
+fan_guard.log
+fan_guard_config.json
+
+# Python caching
+__pycache__/
+*.pyc
+
+# Local system files
+.DS_Store
+Thumbs.db
