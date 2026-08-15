@@ -44,7 +44,6 @@ if MISSING:
 import wmi
 import pystray
 from PIL import Image, ImageDraw, ImageFont
-import urllib.request
 import tkinter as tk
 from tkinter import ttk, messagebox
 
@@ -94,89 +93,130 @@ def save_config(cfg: dict):
 
 
 # ═════════════════════════════════════════════════════════════════════════════
-#  Temperature reading
+#  Shared pipe query helper
 # ═════════════════════════════════════════════════════════════════════════════
-def _get_temps_lhm_web() -> dict:
-    """Read temps from LibreHardwareMonitor Web Server (Port 8085)."""
+def _query_pipe_index(pipe_name: str, index: int):
+    """Query a single hardware data index from the PredatorSense named pipe.
+    Returns the decoded integer value, or None on failure.
+    Data encoding:  result = (value << 8) | status_byte
+    Valid if status_byte == 0, value = bits 8-23."""
+    try:
+        import win32file
+        input_code = 1 | (index << 8)
+        arg = struct.pack("<I", input_code)
+        msg = bytearray()
+        msg += struct.pack("<H", 13)        # cmd_code = query info
+        msg += struct.pack("<B", 1)         # num args
+        msg += struct.pack("<I", len(arg))  # arg length
+        msg += arg
+        handle = win32file.CreateFile(
+            rf"\\.\pipe\{pipe_name}",
+            win32file.GENERIC_READ | win32file.GENERIC_WRITE,
+            0, None, win32file.OPEN_EXISTING, 0, None
+        )
+        win32file.WriteFile(handle, bytes(msg))
+        win32file.FlushFileBuffers(handle)
+        _, raw = win32file.ReadFile(handle, 13)
+        win32file.CloseHandle(handle)
+        raw_val = struct.unpack_from("<Q", raw, 5)[0]
+        if (raw_val & 0xFF) == 0:
+            return (raw_val >> 8) & 0xFFFF
+    except Exception:
+        pass
+    return None
+
+
+def _find_active_pipe() -> str | None:
+    """Return the first available PredatorSense/NitroSense pipe name, or None."""
+    import win32file
+    for pipe_name in ["PredatorSense_service_namedpipe", "NitroSense_service_namedpipe"]:
+        try:
+            handle = win32file.CreateFile(
+                rf"\\.\pipe\{pipe_name}",
+                win32file.GENERIC_READ | win32file.GENERIC_WRITE,
+                0, None, win32file.OPEN_EXISTING, 0, None
+            )
+            win32file.CloseHandle(handle)
+            return pipe_name
+        except Exception:
+            pass
+    return None
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+#  Temperature reading  (no LibreHardwareMonitor required)
+# ═════════════════════════════════════════════════════════════════════════════
+def _get_temps_pipe() -> dict:
+    """Read CPU and GPU temps directly from the PredatorSense service pipe.
+    Index 1 = CPU temperature (°C), Index 10 = GPU temperature (°C)."""
     result = {"CPU": None, "GPU": None}
     try:
-        req = urllib.request.Request("http://localhost:8085/data.json")
-        with urllib.request.urlopen(req, timeout=2) as response:
-            data = json.loads(response.read().decode())
-
-        def find_temps(node, cpu_list, gpu_list):
-            if "Children" in node:
-                for child in node["Children"]:
-                    find_temps(child, cpu_list, gpu_list)
-            if node.get("Type") == "Temperature" or ("Temperature" in node.get("Text", "")):
-                val_str = node.get("Value", "").replace(",", ".").replace(" °C", "").strip()
-                try:
-                    val = float(val_str)
-                    name = node.get("Text", "").upper()
-                    if any(k in name for k in ("CPU", "CORE", "PACKAGE", "TDIE", "TCTL")):
-                        cpu_list.append(val)
-                    if any(k in name for k in ("GPU", "HOTSPOT", "VRAM", "DIODE")):
-                        gpu_list.append(val)
-                except ValueError:
-                    pass
-
-        cpu_temps, gpu_temps = [], []
-        find_temps(data, cpu_temps, gpu_temps)
-        if cpu_temps:
-            result["CPU"] = max(cpu_temps)
-        if gpu_temps:
-            result["GPU"] = max(gpu_temps)
+        import win32file
+        pipe_name = _find_active_pipe()
+        if pipe_name:
+            cpu_raw = _query_pipe_index(pipe_name, 1)
+            gpu_raw = _query_pipe_index(pipe_name, 10)
+            if cpu_raw is not None and cpu_raw > 0:
+                result["CPU"] = float(cpu_raw)
+            if gpu_raw is not None and gpu_raw > 0:
+                result["GPU"] = float(gpu_raw)
+    except ImportError:
+        pass
     except Exception as e:
-        log.debug(f"LHM Web Server: {e}")
+        log.debug(f"Pipe temp read error: {e}")
+    return result
+
+
+def _get_temps_wmi_fallback() -> dict:
+    """Fallback: read temps from OpenHardwareMonitor WMI if the pipe is unavailable."""
+    result = {"CPU": None, "GPU": None}
+    try:
+        w = wmi.WMI(namespace="root\\OpenHardwareMonitor")
+        for sensor in w.Sensor():
+            if sensor.SensorType == "Temperature":
+                name = sensor.Name.upper()
+                val  = float(sensor.Value)
+                if any(k in name for k in ("CPU", "CORE", "PACKAGE", "TDIE")):
+                    if result["CPU"] is None or val > result["CPU"]:
+                        result["CPU"] = val
+                if any(k in name for k in ("GPU", "HOTSPOT")):
+                    if result["GPU"] is None or val > result["GPU"]:
+                        result["GPU"] = val
+    except Exception as e:
+        log.debug(f"WMI temp fallback: {e}")
     return result
 
 
 def get_temps(monitor_type: str = "CPU") -> dict:
-    """Returns {'CPU': float|None, 'GPU': float|None}."""
-    return _get_temps_lhm_web()
+    """Returns {'CPU': float|None, 'GPU': float|None}.
+    Reads directly from the PredatorSense service pipe — no external software needed.
+    Falls back to OpenHardwareMonitor WMI if the pipe is unavailable."""
+    result = _get_temps_pipe()
+    # If pipe returned nothing, try WMI fallback
+    if result["CPU"] is None and result["GPU"] is None:
+        result = _get_temps_wmi_fallback()
+    return result
 
 
+# ═════════════════════════════════════════════════════════════════════════════
+#  Fan RPM reading
+# ═════════════════════════════════════════════════════════════════════════════
 def get_rpms() -> dict:
     """Read CPU and GPU fan RPMs from the PredatorSense named pipe.
     Index 2 = CPU fan RPM, Index 6 = GPU fan RPM (Acer Aspire/Nitro)."""
     result = {"CPU": None, "GPU": None}
     try:
         import win32file
-
-        def query_index(pipe_handle, index: int):
-            input_code = 1 | (index << 8)
-            arg = struct.pack("<I", input_code)
-            msg = bytearray()
-            msg += struct.pack("<H", 13)       # cmd_code
-            msg += struct.pack("<B", 1)        # num args
-            msg += struct.pack("<I", len(arg)) # arg length
-            msg += arg
-            win32file.WriteFile(pipe_handle, bytes(msg))
-            win32file.FlushFileBuffers(pipe_handle)
-            _, raw = win32file.ReadFile(pipe_handle, 13)
-            raw_val = struct.unpack_from("<Q", raw, 5)[0]
-            if (raw_val & 0xFF) == 0:
-                return (raw_val >> 8) & 0xFFFF
-            return None
-
-        for pipe_name in ["PredatorSense_service_namedpipe", "NitroSense_service_namedpipe"]:
-            try:
-                handle = win32file.CreateFile(
-                    rf"\\.\pipe\{pipe_name}",
-                    win32file.GENERIC_READ | win32file.GENERIC_WRITE,
-                    0, None, win32file.OPEN_EXISTING, 0, None
-                )
-                result["CPU"] = query_index(handle, 2)
-                result["GPU"] = query_index(handle, 6)
-                win32file.CloseHandle(handle)
-                break
-            except Exception as e:
-                log.debug(f"RPM pipe {pipe_name}: {e}")
+        pipe_name = _find_active_pipe()
+        if pipe_name:
+            result["CPU"] = _query_pipe_index(pipe_name, 2)
+            result["GPU"] = _query_pipe_index(pipe_name, 6)
     except ImportError:
         pass
     except Exception as e:
         log.debug(f"get_rpms error: {e}")
     return result
+
 
 
 # ═════════════════════════════════════════════════════════════════════════════
